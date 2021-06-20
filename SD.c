@@ -1,6 +1,23 @@
 #include "SD.h"
 #include <avr/io.h>
 
+/* Card type flags (CardType) */
+#define CT_MMC				0x01	/* MMC ver 3 */
+#define CT_SD1				0x02	/* SD ver 1 */
+#define CT_SD2				0x04	/* SD ver 2 */
+#define CT_BLOCK			0x08	/* Block addressing */
+
+/* Definitions for MMC/SDC command */
+#define CMD0	(0x40+0)	/* GO_IDLE_STATE */
+#define CMD1	(0x40+1)	/* SEND_OP_COND (MMC) */
+#define	ACMD41	(0xC0+41)	/* SEND_OP_COND (SDC) */
+#define CMD8	(0x40+8)	/* SEND_IF_COND */
+#define CMD16	(0x40+16)	/* SET_BLOCKLEN */
+#define CMD17	(0x40+17)	/* READ_SINGLE_BLOCK */
+#define CMD24	(0x40+24)	/* WRITE_BLOCK */
+#define CMD55	(0x40+55)	/* APP_CMD */
+#define CMD58	(0x40+58)	/* READ_OCR */
+
 #define FLAG_TIMEOUT        0x80
 #define FLAG_PARAM_ERR      0x40
 #define FLAG_ADDR_ERR       0x20
@@ -10,7 +27,8 @@
 #define FLAG_ERZ_RST        0x02
 #define FLAG_IN_IDLE_MODE   0x01
 
-Boolean gSdSpiFast = true;
+#define SELECT()	PORTB &= ~SD_PIN_CS	/* CS = L */
+#define	DESELECT()	PORTB |=  SD_PIN_CS	/* CS = H */
 
 static void sdSpiDelay(){
 
@@ -20,47 +38,33 @@ static void sdSpiDelay(){
 	t--;
 }
 
-static void sdClockSpeed(Boolean fast){
+static void sdClockSpeed(Boolean speed){
 	
-	gSdSpiFast = fast;
-}
+	if(speed){
+		// Set high speed.
+    	SPCR = (1 << SPE) | (1 << MSTR);
+    	SPSR = 0;
+	}
 
-UInt8 sdSpiByte(UInt8 v);
-
-UInt8 sdSpiByteSlow(UInt8 v){
-	
-	for(UInt8 i = 0; i < 8; i++){
-	
-		if(v & 0x80) PORTB |= SD_PIN_MOSI;
-		else PORTB &=~ SD_PIN_MOSI;
-		
-		sdSpiDelay();
-		
-		PORTB |= SD_PIN_SCLK;
-		
-		sdSpiDelay();
-		
-		v <<= 1;
-		if(PINB & SD_PIN_MISO) v++;
-		PORTB &=~ SD_PIN_SCLK;
-		
-		sdSpiDelay();
+	else{
+		// Set slow speed for initialization.
+    	SPCR = (1 << SPE) | (1 << MSTR) | 3;
+    	SPSR = 0;
 	}
 	
-	PORTB &=~ SD_PIN_MOSI;
-	
-	return v;
 }
 
-static void sdSpiSingleClock(void){
+// From http://www.rjhcoding.com/avrc-sd-interface-1.php
 
-	sdSpiDelay();
-	PORTB |= SD_PIN_MOSI;
-	sdSpiDelay();
-	PORTB |= SD_PIN_SCLK;
-	sdSpiDelay();
-	PORTB &=~ SD_PIN_SCLK;
-	sdSpiDelay();
+UInt8 sdSpiByte(UInt8 v){
+	// load data into register
+    SPDR = v;
+
+    // Wait for transmission complete
+    while(!(SPSR & (1 << SPIF)));
+
+    // return SPDR
+    return SPDR;
 }
 
 UInt8 sdCrc7(UInt8* chr,UInt8 cnt,UInt8 crc){
@@ -83,6 +87,12 @@ UInt8 sdCrc7(UInt8* chr,UInt8 cnt,UInt8 crc){
 }
 
 static inline void sdPrvSendCmd(UInt8 cmd, UInt32 param, Boolean crc){
+
+	/* Select the card */
+	DESELECT();
+	sdSpiByte(0xFF);
+	SELECT();
+	sdSpiByte(0xFF);
 	
 	UInt8 send[6];
 	
@@ -130,48 +140,6 @@ static UInt8 sdPrvReadData(UInt8* data, UInt16 sz){
 	while(sz--) *data++ = sdSpiByte(0xFF);
 	
 	return 0;
-}
-
-static UInt8 sdPrvACMD(UInt8 cmd, UInt32 param, Boolean crc){
-	
-	UInt8 ret;
-	
-	ret = sdPrvSimpleCommand(55, 0, crc);
-	if(ret & FLAG_TIMEOUT) return ret;
-	if(ret & FLAG_ILLEGAL_CMD) return ret;
-	
-	return sdPrvSimpleCommand(cmd, param, crc);
-}
-
-Boolean sdPrvCardInit(Boolean sd, Boolean hc){
-	
-	UInt32 time = 0;
-	UInt32 resp;
-	Boolean first = true;
-	UInt32 param = hc ? (1ULL<< 30) : 0;
-	
-	while(time++ < 10000UL){    //retry 10..0 times
-	
-		//busy bit is top bit of OCR, which is top bit of resp[1]
-		//busy bit at 1 means init complete
-		//see pages 85 and 26
-		
-		resp = sd ? sdPrvACMD(41, param, true) : sdPrvSimpleCommand(1, param, true);
-		
-		if(resp & FLAG_TIMEOUT) break;
-		
-		if(first){
-			
-			param = (hc ? (1UL << 30) : 0UL) | 0x00200000UL;
-			first = false;
-		}
-		else{
-			
-			if(!(resp & FLAG_IN_IDLE_MODE)) return true;
-		}
-	}
-	
-	return false;
 }
 
 UInt32 sdPrvGetBits(UInt8* data,UInt32 numBytesInArray,UInt32 startBit,UInt32 len){//for CID and CSD data..
@@ -239,115 +207,117 @@ static UInt32 sdPrvGetCardNumBlocks(Boolean mmc,UInt8* csd){
 	return cardSz;
 }
 
+// From https://github.com/greiman/PetitFS/blob/master/src/avr_mmcp.cpp
+
 Boolean sdInit(SD* sd){
 
-		UInt8 v;
-		UInt16 tries = 0;   //needs to go high, in case we were in middle of block read before...
-		UInt8 respBuf[16];
-	
-		sd->inited = false;
-		sd->SD = false;
+	UInt8 cmd, n, ty = 0, ocr[4], respBuf[16];
+	unsigned long tmr;
 
-		sdClockSpeed(false);
+	sd->inited = false;
+	sd->SD = false;
 
-		for(v = 0; v < 10; v++) sdSpiByte(0xFF);    //80 clocks with CS not asserted to give card time to init
-	
-		//with CS tied low, we get here with clock sync a bit weird, so we need to re-sync it, we do so here, since we know for sure what the valid RESP for CMD0 is
-		do{
-			sdSpiSingleClock();
-			v = sdPrvSimpleCommand(0, 0, true);
-			//resync usage makes this bad, so i comment it out: if(v & FLAG_TIMEOUT) return false;
-			tries++;
-			if(tries > 600L) return false;
-		}while(v != 0x01);
-	
-		v = sdPrvSimpleCommand(8, 0x000001AAUL, true);  //try CMD8 to init SDHC cards
-		if(v & FLAG_TIMEOUT) return false;
-		sd->HC = !(v & FLAG_ILLEGAL_CMD);
-	
-		v = sdPrvSimpleCommand(55, 0, true);            //see if this is SD or MMC
-		if(v & FLAG_TIMEOUT) return false;
-		sd->SD = !(v & FLAG_ILLEGAL_CMD);
-	
-		if(sd->SD){
-		
-			if(!sdPrvCardInit(true, true) && !sdPrvCardInit(true, false)) return false;
+	sdClockSpeed(false);
+
+	DESELECT();
+	for (n = 10; n; n--) sdSpiByte(0xFF);	/* 80 dummy clocks with CS=H */
+
+	if (sdPrvSimpleCommand(CMD0, 0, true) == 1) {			/* GO_IDLE_STATE */
+		if (sdPrvSimpleCommand(CMD8, 0x1AA, true) == 1) {	/* SDv2 */
+			for (n = 0; n < 4; n++) ocr[n] = sdSpiByte(0xFF);		/* Get trailing return value of R7 resp */
+			if (ocr[2] == 0x01 && ocr[3] == 0xAA) {			/* The card can work at vdd range of 2.7-3.6V */
+				for (tmr = 10000; tmr && sdPrvSimpleCommand(ACMD41, 1UL << 30, true); tmr--) sdSpiDelay();	/* Wait for leaving idle state (ACMD41 with HCS bit) */
+				if (tmr && sdPrvSimpleCommand(CMD58, 0, true) == 0) {		/* Check CCS bit in the OCR */
+					for (n = 0; n < 4; n++) ocr[n] = sdSpiByte(0xFF);
+					ty = (ocr[0] & 0x40) ? CT_SD2 | CT_BLOCK : CT_SD2;	/* SDv2 (HC or SC) */
+				}
+			}
+		} else {							/* SDv1 or MMCv3 */
+			if (sdPrvSimpleCommand(ACMD41, 0, true) <= 1) 	{
+				ty = CT_SD1; cmd = ACMD41;	/* SDv1 */
+			} else {
+				ty = CT_MMC; cmd = CMD1;	/* MMCv3 */
+			}
+			for (tmr = 10000; tmr && sdPrvSimpleCommand(cmd, 0, true); tmr--) sdSpiDelay();	/* Wait for leaving idle state */
+			if (!tmr || sdPrvSimpleCommand(CMD16, 512, true) != 0)			/* Set R/W block length to 512 */
+				ty = 0;
 		}
-		else{
-		
-			if(!sdPrvCardInit(false, true) && !sdPrvCardInit(false, false)) return false;
-		}
+	}
 
-		if(sdPrvSimpleCommand(59, 0, true) & FLAG_TIMEOUT) return false; //crc off
-		if(sdPrvSimpleCommand(9, 0, false) & FLAG_TIMEOUT) return false; //read CSD
+	if(sdPrvSimpleCommand(59, 0, true) & FLAG_TIMEOUT) return false; //crc off
+	if(sdPrvSimpleCommand(9, 0, false) & FLAG_TIMEOUT) return false; //read CSD
 
-		if(sdPrvReadData(respBuf, 16)) return false;
-	
-		sd->numSec = sdPrvGetCardNumBlocks(!sd->SD, respBuf);
-		sd->inited = true;
+	DESELECT();
+	sdSpiByte(0xFF);
 
-		sdClockSpeed(true);
+	if(sdPrvReadData(respBuf, 16)) return false;
 
-	return true;
-}
+	sd->numSec = sdPrvGetCardNumBlocks(!sd->SD, respBuf);
+	sd->inited = !ty;
 
-UInt32 sdGetNumSec(SD* sd){
-	
-	return sd->inited ? sd->numSec : 0;
+	sdClockSpeed(true);
+
+	return sd->inited;
 }
 
 Boolean sdSecRead(SD* sd, UInt32 sec, void* buf, UInt16 sz){   //CMD17
 
-		UInt8 retry = 0;
-	
-		//PIND = (UInt8)(1 << 2);   //LED_r
+	UInt8 retry = 0;
 
-		if(!sd->inited) return false;
+	//PIND = (UInt8)(1 << 2);   //LED_r
 
-		do{
+	if(!sd->inited) return false;
 
-			if(sdPrvSimpleCommand(17, sd->HC ? sec : sec << 9, false) & FLAG_TIMEOUT) return false;
+	do{
 
-			if(!sdPrvReadData(buf, sz)){ // Read sz bytes to buf
-				return true;
-				break;
-			} 
-	
-		}while(++retry < 5);    //retry up to 5 times
-	
-		//PIND = (UInt8)(1 << 2);   //LED_r
+		if(sdPrvSimpleCommand(17, sd->HC ? sec : sec << 9, false) & FLAG_TIMEOUT) return false;
+
+		if(!sdPrvReadData(buf, sz)){ // Read sz bytes to buf
+			return true;
+			break;
+		} 
+
+	}while(++retry < 5);    //retry up to 5 times
+
+	//PIND = (UInt8)(1 << 2);   //LED_r
+
+	DESELECT();
+	sdSpiByte(0xFF);
 }
 
 
 Boolean sdSecWrite(SD* sd, UInt32 sec, UInt8* buf, UInt16 sz){  //CMD24
 
-		UInt8 retry = 0, v;
-		
-		//writechar('W');
+	UInt8 retry = 0, v;
 	
-		//PIND = (UInt8)(1 << 3);   //LED_w
-	
-		if(!sd->inited) return false;
-	
-		do{
-			
-			if(sdPrvSimpleCommand(24, sd->HC ? sec : sec << 9, false) & FLAG_TIMEOUT) return false;
-		
-			sdSpiByte(0xFF);    //as per SD-spi spec, we give it 8 clocks to consider the ramifications of the command we just sent
-			sdSpiByte(0xFF);    //start of data block
+	//writechar('W');
 
-			for(UInt16 v16 = 0; v16 < sz; v16++) sdSpiByte(*buf++);    //data
-			
-			while((v = sdSpiByte(0xFF)) == 0xFF);   //wait while card isnt answering
-			while(sdSpiByte(0xFF) != 0xFF); //wait while card is busy
+	//PIND = (UInt8)(1 << 3);   //LED_w
+
+	if(!sd->inited) return false;
+
+	do{
 		
-			if((v & 0x1F) == 5){
-				return true;
-			} 
-		
-		}while(++retry < 5);        //retry up to 5 times
+		if(sdPrvSimpleCommand(24, sd->HC ? sec : sec << 9, false) & FLAG_TIMEOUT) return false;
 	
-		//PIND = (UInt8)(1 << 3);   //LED_w
+		sdSpiByte(0xFF);    //as per SD-spi spec, we give it 8 clocks to consider the ramifications of the command we just sent
+		sdSpiByte(0xFF);    //start of data block
+
+		for(UInt16 v16 = 0; v16 < sz; v16++) sdSpiByte(*buf++);    //data
+		
+		while((v = sdSpiByte(0xFF)) == 0xFF);   //wait while card isnt answering
+		while(sdSpiByte(0xFF) != 0xFF); //wait while card is busy
+	
+		if((v & 0x1F) == 5){
+			return true;
+		} 
+	
+	}while(++retry < 5);        //retry up to 5 times
+
+	//PIND = (UInt8)(1 << 3);   //LED_w
+
+	DESELECT();
+	rcv_spi();
 }
 
 /* @raspiduino's code */

@@ -37,6 +37,7 @@ typedef struct{
 */
 
 // SD card pin
+#define SD_PIN_CS       (1 << PINB2) // Arduino UNO's digital pin 10
 #define SD_PIN_MOSI     (1 << PINB3) // Arduino UNO's digital pin 11
 #define SD_PIN_MISO     (1 << PINB4) // Arduino UNO's digital pin 12
 #define SD_PIN_SCLK     (1 << PINB5) // Arduino UNO's digital pin 13

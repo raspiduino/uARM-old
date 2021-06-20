@@ -40,7 +40,7 @@ int rootOps(void* userData, UInt32 sector, void* buf, UInt8 op){
 		case BLK_OP_SIZE:
 			
 			if(sector == 0){	//num blocks
-				*(unsigned long*)buf = sdGetNumSec(sd);
+				*(unsigned long*)buf = sd->inited ? sd->numSec : 0;
 			}
 			else if(sector == 1){	//block size
 				
@@ -87,8 +87,14 @@ void init(){
 
     // From http://www.rjhcoding.com/avrc-sd-interface-1.php
 
-    // Set up hardware SPI for SD card IO
-    DDRB |= SD_PIN_MOSI | SD_PIN_SCLK;
+    // set CS, MOSI and SCLK to output
+    DDRB |= (1 << SD_PIN_CS) | (1 << SD_PIN_MOSI) | (1 << SD_PIN_SCLK);
+
+    // enable pull up resistor in MISO
+    DDRB |= (1 << SD_PIN_MISO);
+
+    // enable SPI, set as master, and clock to fosc/128
+    SPCR = (1 << SPE) | (1 << MSTR) | (1 << SPR1) | (1 << SPR0);
 }
 
 Boolean coRamAccess(_UNUSED_ CalloutRam* ram, UInt32 addr, UInt8 size, Boolean write, void* bufP){

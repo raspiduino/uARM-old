@@ -11,7 +11,7 @@ ifeq ($(BUILD), avr)
 	CC              = avr-gcc
 	LD              = avr-gcc
 	EXTRA           = avr-size -Ax $(APP) && avr-objcopy -j .text -j .data -O ihex $(APP) $(APP).hex
-	EXTRA_OBJS      = SD.o main_avr.o avr_asm.o
+	EXTRA_OBJS      = SD.o main_avr.o
 endif
 
 ifeq ($(BUILD), debug)
@@ -67,9 +67,6 @@ cp15.o: cp15.c cp15.h CPU.h types.h
 
 mem.o: mem.c mem.h types.h
 	$(CC) $(CCFLAGS) -o mem.o -c mem.c
-
-avr_asm.o: avr_asm.S
-	$(CC) $(CCFLAGS) -o avr_asm.o -c avr_asm.S
 
 RAM.o: RAM.c RAM.h mem.h types.h
 	$(CC) $(CCFLAGS) -o RAM.o -c RAM.c
